@@ -1,0 +1,104 @@
+name: CI/CD Pipeline
+
+# ─── TRIGGER ───────────────────────────────────────────────
+# This pipeline runs every time you push to the main branch
+on:
+  push:
+    branches:
+      - main
+
+# ─── JOBS ──────────────────────────────────────────────────
+jobs:
+
+  # ── JOB 1: TEST ──────────────────────────────────────────
+  # Runs your tests first — if tests fail, we stop here
+  # and never deploy broken code to AWS
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Download your code onto the GitHub Actions runner
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Install Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      # Step 3: Install your app's dependencies
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest
+
+      # Step 4: Run your tests
+      - name: Run tests
+        run: pytest app/test_app.py -v
+
+
+  # ── JOB 2: BUILD & DEPLOY ─────────────────────────────────
+  # Only runs if JOB 1 (tests) passed
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test  # ← This means "wait for test job to pass first"
+
+    steps:
+      # Step 1: Download your code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Log into AWS using the secrets you added to GitHub
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Step 3: Log into ECR (your private Docker registry on AWS)
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # Step 4: Build the Docker image and push it to ECR
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # Step 5: SSH into your EC2 server and deploy the new image
+      - name: Deploy to EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,AWS_REGION
+          script: |
+            # Log into ECR from the EC2 server
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            # Pull the latest image
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+            # Stop and remove the old container if it exists
+            docker stop cicd-app || true
+            docker rm cicd-app || true
+
+            # Run the new container
+            docker run -d \
+              --name cicd-app \
+              --restart always \
+              -p 80:5000 \
+              $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
